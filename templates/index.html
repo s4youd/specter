@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Specter — JS Security Recon</title>
+    <link rel="icon" type="image/png" href="https://avatars.githubusercontent.com/u/212823433?s=400&u=cf6999ae50fc524333b6a06c13c15809017e1281&v=4">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div class="app">
+        <header class="hero">
+            <div class="brand">
+                <div class="logo-ring">
+                    <a href="https://sayed.is-a.dev" target="_blank" rel="noopener" title="sayed.is-a.dev" style="display:block;line-height:0">
+                        <img src="https://avatars.githubusercontent.com/u/212823433?s=400&u=cf6999ae50fc524333b6a06c13c15809017e1281&v=4" alt="Specter logo" class="logo">
+                    </a>
+                    <span class="logo-pulse" aria-hidden="true"></span>
+                </div>
+                <div class="brand-text">
+                    <h1>Specter</h1>
+                    <p class="tagline">JavaScript Security Recon &mdash; secrets, endpoints &amp; live validation</p>
+                </div>
+            </div>
+            <div class="hero-badges">
+                <span class="pill"><span class="dot dot-live"></span>90+ secret detectors</span>
+                <span class="pill"><span class="dot dot-accent"></span>Zero-FP engine</span>
+                <span class="pill"><span class="dot dot-ok"></span>Read-only validation</span>
+            </div>
+        </header>
+
+        <section class="card input-card">
+            <div class="tabs">
+                <button class="tab active" data-tab="single">Single URL</button>
+                <button class="tab" data-tab="multi">Bulk</button>
+                <button class="tab" data-tab="file">File</button>
+            </div>
+
+            <div id="tab-single" class="tab-body">
+                <div class="input-row">
+                    <div class="input-wrapper">
+                        <svg class="input-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
+                        <input type="text" id="jsUrl" placeholder="https://target.com/app.js" autocomplete="off" spellcheck="false">
+                        <button class="clear-btn" data-clear="jsUrl" title="Clear">&times;</button>
+                    </div>
+                    <button id="analyzeBtn" class="btn btn-primary" data-scan>
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+                        Scan
+                    </button>
+                </div>
+            </div>
+
+            <div id="tab-multi" class="tab-body hidden">
+                <div class="input-wrapper">
+                    <textarea id="multipleUrls" rows="6" placeholder="One URL per line&#10;https://target.com/app.js&#10;https://target.com/vendor.chunk.js" spellcheck="false"></textarea>
+                    <button class="clear-btn clear-textarea" data-clear="multipleUrls" title="Clear">&times;</button>
+                </div>
+                <button id="analyzeMultipleBtn" class="btn btn-primary tab-btn" data-scan>Scan All</button>
+            </div>
+
+            <div id="tab-file" class="tab-body hidden">
+                <label class="file-drop" for="urlFile">
+                    <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="drop-icon"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                    <span>Drop a file with URLs or click to browse</span>
+                    <span class="drop-hint">.txt or .csv, one URL per line</span>
+                    <input type="file" id="urlFile" accept=".txt,.csv">
+                </label>
+                <div id="fileName" class="file-info hidden"></div>
+                <button id="analyzeFileBtn" class="btn btn-primary tab-btn" disabled data-scan>Scan File</button>
+            </div>
+
+            <div id="loading" class="loading hidden">
+                <div class="progress-container">
+                    <div class="progress-header">
+                        <span class="progress-label" id="loading-text">Initializing...</span>
+                        <span class="progress-percent" id="loading-percent">0%</span>
+                    </div>
+                    <div class="progress-track">
+                        <div class="progress-fill" id="progress-fill"></div>
+                    </div>
+                    <div class="progress-footer">
+                        <div class="progress-detail" id="progress-detail"></div>
+                        <button id="stopScanBtn" class="btn-stop" title="Stop scanning and show current results">Stop</button>
+                    </div>
+                </div>
+            </div>
+            <p class="scope-note">Authorized testing only &mdash; scan JS you own or are permitted to test. Validation uses safe read-only identity checks.</p>
+        </section>
+
+        <div id="error" class="error hidden"></div>
+
+        <section id="output" class="output hidden">
+            <div class="output-summary" id="output-summary"></div>
+
+            <!-- Action bar: validate (URL status/title/words are probed automatically during scan) -->
+            <div class="action-bar">
+                <button id="validateAllBtn" class="btn btn-validate">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>
+                    <span>Validate All Secrets</span>
+                </button>
+                <span class="action-hint" id="actionHint">Run a scan first, then validate with one click. URLs show status, title &amp; word count automatically.</span>
+            </div>
+
+            <div id="validationPanel" class="result-panel hidden"></div>
+            <div id="globalPanel" class="global-panel hidden"></div>
+
+            <div class="output-toolbar">
+                <div class="search-box">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                    <input type="text" id="searchInput" placeholder="Search secrets, endpoints, files..." autocomplete="off" spellcheck="false">
+                    <button class="clear-btn" data-clear="searchInput" title="Clear">&times;</button>
+                </div>
+                <div class="toolbar-group">
+                    <label class="toolbar-label">Severity</label>
+                    <select id="severityFilter" class="toolbar-select">
+                        <option value="all">All</option>
+                        <option value="critical">Critical</option>
+                        <option value="high">High</option>
+                        <option value="medium">Medium</option>
+                        <option value="low">Low</option>
+                    </select>
+                </div>
+                <div class="toolbar-group">
+                    <label class="toolbar-label">Sort</label>
+                    <select id="sortSelect" class="toolbar-select">
+                        <option value="severity">Severity</option>
+                        <option value="secrets">Most Secrets</option>
+                        <option value="endpoints">Most Endpoints</option>
+                        <option value="type">Name</option>
+                        <option value="file">URL</option>
+                    </select>
+                </div>
+                <div class="toolbar-actions">
+                    <button id="toggleAllBtn" class="btn btn-outline btn-sm">Expand All</button>
+                    <button id="exportBtn" class="btn btn-outline btn-sm">Export JSON</button>
+                </div>
+            </div>
+            <div id="fileCards" class="file-cards"></div>
+        </section>
+
+        <footer>
+            <p>Specter by <a href="https://sayed.is-a.dev" target="_blank" rel="noopener">s4youd</a> &mdash; use only against in-scope, authorized targets.</p>
+        </footer>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
