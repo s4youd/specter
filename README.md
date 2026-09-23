@@ -19,7 +19,7 @@ All analysis runs server-side. The browser receives results only.
 ```bash
 git clone https://github.com/s4youd/Specter.git
 cd Specter
-pip install -r requirements.txt
+pip install -r requirements.txt --break-system-packages
 ```
 
 ## Run
