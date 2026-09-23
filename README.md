@@ -10,7 +10,12 @@ command, and the UI adds
 one-click **Validate All Secrets** (live / dead / needs-hands verdicts).
 URL status, title, and word count are probed automatically during every
 scan. Identical secrets found
-across 3+ files are consolidated into one entry listing every file.
+across 3+ files are consolidated into one entry listing every file
+(grouped by secret type + extracted credential value, so different
+assignment styles still merge). Identical endpoints across 2+ files are
+consolidated the same way (host lowercased, trailing slashes/fragments
+normalized, query strings kept distinct, HTTP methods merged) with each
+distinct URL probed once per batch.
 
 All analysis runs server-side. The browser receives results only.
 
@@ -50,7 +55,9 @@ or drop a `.txt`/`.csv` file with one URL per line. After a scan:
   and its validation command. Every endpoint URL opens in a new tab.
 - **Cross-file duplicates** — the same secret in 3+ files shows once with
   a `×N files` badge and a clickable list of every file (also included in
-  JSON export).
+  JSON export). The same endpoint in 2+ files shows once with a `×N`
+  badge, merged HTTP methods, and its file list. Server-side consolidation
+  keeps the API, CLI batch JSON, and UI consistent.
 
 ### CLI (recon pipeline friendly)
 

@@ -260,6 +260,101 @@ def test_render_curl_fills_value():
     assert extract_value('github_token = "abc123"') == "abc123"
 
 
+# ---------------------------------------------------------------- cross-file consolidation
+
+def _sfile(fid, url, secrets=None, endpoints=None, subs=None):
+    return {'file_id': fid, 'url': url, 'secrets': secrets or [],
+            'endpoints': endpoints or [], 'sub_files': subs or []}
+
+
+def test_canonical_secret_key_normalizes_styles():
+    a = JavaScriptAnalyzer()
+    assert (a.canonical_secret_key('T', 'apiKey = "ABC123"')
+            == a.canonical_secret_key('T', 'ABC123'))
+    assert (a.canonical_secret_key('A', 'm') != a.canonical_secret_key('B', 'm')), \
+        "type-sensitive: colliding shapes must not merge"
+
+
+def test_consolidate_secrets_three_files_merge():
+    a = JavaScriptAnalyzer()
+    files = [
+        _sfile(1, 'https://t/a.js', [{'type': 'G', 'match': 'ghp_X', 'line': 5}]),
+        _sfile(2, 'https://t/b.js', [{'type': 'G', 'match': 'github_token = "ghp_X"', 'line': 9}]),
+        _sfile(3, 'https://t/c.js', [{'type': 'G', 'match': 'ghp_X', 'line': 2}]),
+    ]
+    a.consolidate_secrets_cross_file(files, threshold=3)
+    assert len(files[0]['secrets']) == 1
+    assert files[0]['secrets'][0]['also_found_in'] == ['https://t/b.js', 'https://t/c.js']
+    assert files[1]['secrets'] == [] and files[2]['secrets'] == []
+    import json as _j
+    snap = _j.dumps(files)
+    a.consolidate_secrets_cross_file(files, threshold=3)
+    assert _j.dumps(files) == snap, "re-run must be idempotent"
+
+
+def test_consolidate_secrets_two_files_untouched():
+    a = JavaScriptAnalyzer()
+    files = [_sfile(1, 'u1', [{'type': 'X', 'match': 'm', 'line': 1}]),
+             _sfile(2, 'u2', [{'type': 'X', 'match': 'm', 'line': 1}])]
+    a.consolidate_secrets_cross_file(files, threshold=3)
+    assert len(files[0]['secrets']) == 1 and len(files[1]['secrets']) == 1
+    assert 'also_found_in' not in files[0]['secrets'][0]
+
+
+def test_normalize_endpoint_url():
+    a = JavaScriptAnalyzer()
+    assert a.normalize_endpoint_url('https://H.com:443/a/') == 'https://h.com/a'
+    assert a.normalize_endpoint_url('https://h.com/a/?x=1#frag') == 'https://h.com/a?x=1'
+    assert a.normalize_endpoint_url('/api/x/') == '/api/x'
+    assert a.normalize_endpoint_url('/api/x?a=1') == '/api/x?a=1'
+    op = 'https://h.com/graphql#GetUser'
+    assert a.normalize_endpoint_url(op) == op, "GraphQL op identity preserved"
+
+
+def test_consolidate_endpoints_two_files_merge_methods():
+    a = JavaScriptAnalyzer()
+    files = [
+        _sfile(1, 'https://t/a.js', None,
+               [{'method': 'GET', 'absolute_url': 'https://api.t.com/v1/users', 'line': 1}]),
+        _sfile(2, 'https://t/b.js', None,
+               [{'method': 'POST', 'absolute_url': 'https://api.t.com/v1/users/', 'line': 4}]),
+    ]
+    a.consolidate_endpoints_cross_file(files, threshold=2)
+    assert files[1]['endpoints'] == []
+    s = files[0]['endpoints'][0]
+    assert s['also_found_in'] == ['https://t/b.js'], s
+    assert s.get('methods') == ['GET', 'POST'], s
+
+
+def test_consolidate_endpoints_query_and_graphql_distinct():
+    a = JavaScriptAnalyzer()
+    files = [
+        _sfile(1, 'u1', None, [{'method': 'GET', 'absolute_url': 'https://h.com/api?a=1', 'line': 1}]),
+        _sfile(2, 'u2', None, [{'method': 'GET', 'absolute_url': 'https://h.com/api?a=2', 'line': 1}]),
+        _sfile(3, 'u3', None, [{'method': 'GET', 'absolute_url': 'https://h.com/graphql#GetUser', 'line': 1}]),
+        _sfile(4, 'u4', None, [{'method': 'GET', 'absolute_url': 'https://h.com/graphql#ListOrders', 'line': 1}]),
+    ]
+    a.consolidate_endpoints_cross_file(files, threshold=2)
+    assert all(len(f['endpoints']) == 1 for f in files), "query/graphql rows must stay distinct"
+
+
+def test_probe_across_files_probes_once(monkeypatch):
+    a = JavaScriptAnalyzer()
+    calls = []
+    monkeypatch.setattr(a, 'probe_endpoint',
+                        lambda u, timeout=10, _retries=2: (
+                            calls.append(u),
+                            {'status': 200, 'title': 'T', 'word_count': 1,
+                             'content_length': 1, 'final_url': u,
+                             'content_type': 'text/html'})[1])
+    files = [_sfile(1, 'f1', None, [{'absolute_url': 'https://x.com/a', 'line': 1}]),
+             _sfile(2, 'f2', None, [{'absolute_url': 'https://x.com/a', 'line': 2}])]
+    a.probe_across_files(files)
+    assert calls == ['https://x.com/a'], calls
+    assert files[0]['endpoints'][0]['probe']['status'] == 200
+    assert files[1]['endpoints'][0]['probe']['status'] == 200
+
+
 # ---------------------------------------------------------------- server guards
 
 def test_liveness_blocks_private_by_default():
@@ -350,6 +445,30 @@ def test_analyze_recovers_embedded_sources():
     assert len(paths) == 1 and '3 original source paths' in paths[0]['match']
     sm = [m for m in res.source_maps if m['match'] == 'app.js.map'][0]
     assert sm['embedded_sources'] == 1 and sm['source_paths'] == 3
+
+
+def test_sourcemap_truncation_surfaced():
+    import sourcemap as _sm2
+    a = JavaScriptAnalyzer()
+    n = _sm2.MAX_SOURCES + 5
+    big = _json.dumps({
+        "version": 3, "file": "app.js",
+        "sources": [f"src/f{i}.ts" for i in range(n)],
+        "sourcesContent": [("var secret_%d = 'x';\n" % i) + "x" * 120 for i in range(n)],
+        "mappings": "AAAA",
+    })
+    by_url = {
+        "https://target.com/main.js": 'var x = 1;\n//# sourceMappingURL=app.js.map\n',
+        "https://target.com/app.js.map": big,
+    }
+    a.fetch_js_file = lambda url: by_url.get(url)
+    a.probe_endpoints = lambda eps, max_workers=8: None
+    res = a.analyze("https://target.com/main.js")
+    assert len(res.sub_files) == _sm2.MAX_SOURCES, len(res.sub_files)
+    sm = [m for m in res.source_maps if m['match'] == 'app.js.map'][0]
+    assert sm['sources_total'] == n and sm['truncated_sources'] is True, sm
+    paths = [r for r in res.internal_refs if r['type'] == 'Exposed Source Paths'][0]
+    assert 'scanned' in paths['match'] and '3 original source paths' not in paths['match']
 
 
 def test_analyze_legacy_non_map_subfile():

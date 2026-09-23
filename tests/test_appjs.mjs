@@ -31,9 +31,11 @@ const stubDoc = {
   },
 };
 
-const NAMES = ['esc', 'escAttr', 'secKeyOf', 'consolidateSecrets', 'secretsOfFile',
-  'shortFileName', 'renderAlsoFound', 'excerptRange', 'renderExcerpt',
-  'inlineValidationBadge', 'statusLabel', 'renderSecretsTable'];
+const NAMES = ['esc', 'escAttr', 'extractSecretValue', 'canonicalSecretKey',
+  'normalizeEndpointUrl', 'canonicalEndpointKey', 'secKeyOf',
+  'consolidateSecrets', 'consolidateEndpoints', 'secretsOfFile',
+  'shortFileName', 'toggleDup', 'renderAlsoFound', 'excerptRange', 'renderExcerpt',
+  'inlineValidationBadge', 'statusLabel', 'renderSecretsTable', 'endpointRow'];
 const factory = new Function('document', 'window',
   'let expandedSecrets = new Set();\n' + NAMES.map(extract).join('\n') +
   '\nreturn {' + NAMES.join(',') + ', expandedSecrets};');
@@ -141,5 +143,85 @@ const copies = html.match(/data-copy="([^"]*)"/g) || [];
 ok(copies.length >= 3, 'copy buttons present, got ' + copies.length);
 ok(html.includes('&quot;Authorization: token ghp_X&quot;'), 'full validation command in data-copy');
 ok(html.includes('ctx-hl'), 'excerpt match highlight');
+
+// --- normalized secret keys: assignment styles merge, types stay distinct ---
+ok(F.canonicalSecretKey('T', 'apiKey = "ABC"') === F.canonicalSecretKey('T', 'ABC'),
+  'normalized secret key merges styles');
+ok(F.canonicalSecretKey('A', 'm') !== F.canonicalSecretKey('B', 'm'),
+  'normalized secret key type-sensitive');
+let ns = [
+  { file_id: 1, url: 'https://t/a.js', secrets: [{ type: 'G', match: 'ghp_X', line: 5 }] },
+  { file_id: 2, url: 'https://t/b.js', secrets: [{ type: 'G', match: 'github_token = "ghp_X"', line: 9 }] },
+  { file_id: 3, url: 'https://t/c.js', secrets: [{ type: 'G', match: 'ghp_X', line: 2 }] },
+];
+F.consolidateSecrets(ns);
+ok(ns[0].secrets.length === 1 && ns[0].secrets[0].also_found_in.length === 2,
+  'normalized styles consolidate across 3 files');
+ok(ns[1].secrets.length === 0 && ns[2].secrets.length === 0, 'normalized copies removed');
+
+// --- endpoint normalization ---
+ok(F.normalizeEndpointUrl('https://H.com:443/a/') === 'https://h.com/a', 'endpoint host/port/slash norm');
+ok(F.normalizeEndpointUrl('/api/x/') === '/api/x', 'relative slash norm');
+ok(F.normalizeEndpointUrl('/api/x?a=1') === '/api/x?a=1', 'query preserved');
+ok(F.normalizeEndpointUrl('https://h.com/graphql#GetUser') === 'https://h.com/graphql#GetUser',
+  'graphql op identity preserved');
+
+// --- endpoint consolidation: 2+ files merge, methods merge, badge renders ---
+let e = [
+  { file_id: 1, url: 'https://t/a.js', endpoints: [{ method: 'GET', absolute_url: 'https://api.t.com/v1/users', line: 1 }] },
+  { file_id: 2, url: 'https://t/b.js', endpoints: [{ method: 'POST', absolute_url: 'https://api.t.com/v1/users/', line: 4 }] },
+];
+F.consolidateEndpoints(e, 2);
+ok(e[0].endpoints.length === 1 && e[1].endpoints.length === 0, 'endpoint duplicates collapse at 2+');
+ok(e[0].endpoints[0].also_found_in.includes('https://t/b.js'), 'endpoint attribution');
+ok(JSON.stringify(e[0].endpoints[0].methods) === JSON.stringify(['GET', 'POST']), 'endpoint methods merged');
+const esnap = JSON.stringify(e);
+F.consolidateEndpoints(e, 2);
+ok(JSON.stringify(e) === esnap, 'endpoint consolidation idempotent');
+let q = [
+  { file_id: 1, url: 'u1', endpoints: [{ method: 'GET', absolute_url: 'https://h.com/api?a=1', line: 1 }] },
+  { file_id: 2, url: 'u2', endpoints: [{ method: 'GET', absolute_url: 'https://h.com/api?a=2', line: 1 }] },
+];
+F.consolidateEndpoints(q, 2);
+ok(q[0].endpoints.length === 1 && q[1].endpoints.length === 1, 'query variants stay distinct');
+const epHtml = F.endpointRow(e[0].endpoints[0], null);
+ok(epHtml.includes('×2') && epHtml.includes('https://t/b.js'), 'endpoint badge + file links');
+const epSolo = F.endpointRow({ method: 'GET', absolute_url: 'https://h.com/solo', line: 3 }, null);
+ok(!epSolo.includes('dup-badge'), 'no badge on unique endpoint');
+
+// --- also-found-in dropdown menu: collapsed toggle + full link list ---
+const alsoHtml = F.renderAlsoFound({ also_found_in: ['https://t/b.js', 'https://t/c.js'] });
+ok(alsoHtml.includes('data-dup-toggle'), 'dup toggle button rendered');
+ok(alsoHtml.includes('Also found in 3 files'), 'dup toggle label with count');
+ok(alsoHtml.includes('dup-files') && alsoHtml.includes('https://t/c.js'),
+  'dup file list present (collapsed by CSS until opened)');
+ok(F.renderAlsoFound({}) === '' && F.renderAlsoFound({ also_found_in: [] }) === '',
+  'no dup menu without extras');
+// --- toggleDup logic: flips open state + aria ---
+function stubBtn() {
+  const cls = new Set();
+  return {
+    _wrap: { classList: { toggle: (c) => { cls.has(c) ? cls.delete(c) : cls.add(c); return cls.has(c); } } },
+    closest: function (sel) { return sel === '.dup-wrap' ? this._wrap : null; },
+    setAttribute: function (k, v) { this[k] = v; },
+  };
+}
+const tb = stubBtn();
+ok(F.toggleDup(tb) === true && tb['aria-expanded'] === 'true', 'dup opens');
+ok(F.toggleDup(tb) === false && tb['aria-expanded'] === 'false', 'dup closes');
+const orphan = { closest: () => null, setAttribute: () => {} };
+ok(F.toggleDup(orphan) === false, 'dup without wrapper stays closed');
+// --- endpoint dup is a dropdown too ---
+ok(epHtml.includes('data-dup-toggle') && epHtml.includes('dup-files'),
+  'endpoint dup renders as dropdown menu');
+// --- per-file body: single inner wrapper so tabs + panels expand as one ---
+ok(src.includes('file-row-inner'), 'file-row-body uses single inner wrapper');
+// --- CSS theme guards: dark scrollbars + dark select options ---
+const css = fs.readFileSync(path.join(root, 'static', 'css', 'style.css'), 'utf8');
+ok(css.includes('textarea::-webkit-scrollbar'), 'themed textarea scrollbar');
+ok(css.includes('scrollbar-width:thin'), 'firefox scrollbar theming');
+ok(css.includes('.toolbar-select option'), 'dark select option list');
+ok(css.includes('.dup-wrap.open .dup-files'), 'dup open-state rule');
+ok(!css.includes('.file-row-body > *'), 'no multi-child grid collapse rule');
 
 console.log(`ALL ${pass} JS CHECKS PASS`);

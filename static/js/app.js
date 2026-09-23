@@ -5,8 +5,72 @@ let expandedSecrets = new Set();   // secKeyOf(s) -> survives re-renders
 let streamingActive = false;
 let activeTabs = {};
 
+function extractSecretValue(matchedText) {
+    // JS port of validators.extract_value: longest quoted segment,
+    // bare key=value fallback, else the trimmed whole match (Telegram /
+    // webhook style where the match IS the secret). Fail-open: never drop.
+    let value = String(matchedText || '').trim();
+    if (!value) return '';
+    let best = '';
+    for (const q of ['"', "'", '`']) {
+        const qi = value.indexOf(q);
+        if (qi >= 0) {
+            const qe = value.lastIndexOf(q);
+            if (qe > qi) {
+                const cand = value.slice(qi + 1, qe);
+                if (cand.length > best.length) best = cand;
+            }
+        }
+    }
+    if (best) return best.trim();
+    if (value.includes('=') && !/\s/.test(value.trim())) {
+        const parts = value.split('=');
+        if (parts.length === 2 && parts[1].trim()) {
+            return parts[1].trim().replace(/^["'`]|["'`]$/g, '');
+        }
+    }
+    return value;
+}
+function canonicalSecretKey(type, match) {
+    return (type || '').trim() + '||' + extractSecretValue(match).trim().substring(0, 300);
+}
+function normalizeEndpointUrl(url) {
+    if (!url) return '';
+    const u = String(url).trim();
+    if (!u) return '';
+    if (u.includes('/graphql#')) return u; // op name is identity
+    try {
+        // Relative path (no scheme/host): normalize trailing slash, keep query.
+        if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(u)) {
+            const hashIx = u.indexOf('#');
+            const noFrag = hashIx >= 0 ? u.slice(0, hashIx) : u;
+            const qIx = noFrag.indexOf('?');
+            let path = qIx >= 0 ? noFrag.slice(0, qIx) : noFrag;
+            const q = qIx >= 0 ? noFrag.slice(qIx) : '';
+            if (path.length > 1 && path.endsWith('/')) path = path.replace(/\/+$/, '');
+            return (path || '/') + q;
+        }
+        const parsed = new URL(u);
+        const scheme = parsed.protocol.replace(':', '').toLowerCase();
+        let host = (parsed.hostname || '').toLowerCase();
+        if (!host) return u;
+        const port = parsed.port;
+        if (port && !((scheme === 'https' && port === '443') || (scheme === 'http' && port === '80'))) {
+            host = host + ':' + port;
+        }
+        let path = parsed.pathname || '/';
+        if (path.length > 1 && path.endsWith('/')) path = path.replace(/\/+$/, '');
+        let out = scheme + '://' + host + path;
+        if (parsed.search) out += parsed.search;
+        return out;
+    } catch { return u; }
+}
+function canonicalEndpointKey(ep) {
+    const raw = (ep && (ep.absolute_url || ep.path)) || '';
+    return normalizeEndpointUrl(raw);
+}
 function secKeyOf(s) {
-    return (s.type || '') + '||' + (s.match || '').substring(0, 80);
+    return canonicalSecretKey(s.type, s.match).substring(0, 300);
 }
 let abortController = null;
 let isScanning = false;
@@ -18,36 +82,46 @@ function isFileClean(f) {
 }
 function getVisibleFiles() { return allResults.filter(f => !isFileClean(f)); }
 function consolidateSecrets(files) {
-    // Same secret (type + value) found in 3+ files (main or sub-files) ->
-    // keep it once, with also_found_in listing the other file URLs.
-    // The survivor prefers a main-file entry so its accordion stays visible.
-    // Pure over `files` (mutates entries in place); returns files.
+    // Same secret (type + normalized value) found in 3+ files (main or
+    // sub-files) -> keep it once, with also_found_in listing the other file
+    // URLs + also_found_details carrying line numbers. Survivor prefers a
+    // main-file entry so its accordion stays visible. Mutates in place.
     const groups = new Map();
     files.forEach(f => {
         (f.secrets || []).forEach(s => {
-            const k = (s.type || '') + '||' + (s.match || '');
+            const k = canonicalSecretKey(s.type, s.match);
             if (!groups.has(k)) groups.set(k, []);
-            groups.get(k).push({ arr: f.secrets, s, url: f.url,
-                                 rank: (f.file_id || 0) * 1e6 + (s.line || 0), main: true });
+            groups.get(k).push({ arr: f.secrets, s, url: f.url, line: s.line || 0,
+                                 rank: (f.file_id || 0) * 1e6 + (s.line || 0), main: true, sub: false });
         });
         (f.sub_files || []).forEach(sf => {
             (sf.secrets || []).forEach(s => {
-                const k = (s.type || '') + '||' + (s.match || '');
+                const k = canonicalSecretKey(s.type, s.match);
                 if (!groups.has(k)) groups.set(k, []);
-                groups.get(k).push({ arr: sf.secrets, s, url: sf.url || f.url,
-                                     rank: (f.file_id || 0) * 1e6 + 5e5 + (s.line || 0), main: false });
+                groups.get(k).push({ arr: sf.secrets, s, url: sf.url || f.url, line: s.line || 0,
+                                     rank: (f.file_id || 0) * 1e6 + 5e5 + (s.line || 0), main: false, sub: true });
             });
         });
     });
     groups.forEach(g => {
-        const urls = [...new Set(g.map(x => x.url))];
+        const urls = [...new Set(g.map(x => x.url).filter(Boolean))];
         if (urls.length < 3) {
-            // Leave prior consolidations intact so re-runs are idempotent.
-            g.forEach(x => { if (!x.s.also_found_in) delete x.s.also_found_in; });
+            // Idempotent re-runs: a lone survivor carrying prior
+            // also_found_in means an earlier pass already consolidated;
+            // leave it intact. Only clear when genuine duplicates are
+            // present below threshold (they must display separately).
+            if (g.length > 1) g.forEach(x => { delete x.s.also_found_in; delete x.s.also_found_details; });
             return;
         }
         g.sort((a, b) => (a.main === b.main ? a.rank - b.rank : (a.main ? -1 : 1)));
         g[0].s.also_found_in = urls.filter(u => u !== g[0].url);
+        const seen = new Set();
+        const details = [];
+        g.slice(1).forEach(x => {
+            const dk = x.url + '||' + x.line + '||' + (x.sub ? '1' : '0');
+            if (!seen.has(dk)) { seen.add(dk); details.push({ url: x.url, line: x.line, sub_file: x.sub }); }
+        });
+        g[0].s.also_found_details = details;
         for (let i = 1; i < g.length; i++) {
             const ix = g[i].arr.indexOf(g[i].s);
             if (ix >= 0) g[i].arr.splice(ix, 1);
@@ -56,7 +130,60 @@ function consolidateSecrets(files) {
     return files;
 }
 
-function consolidateDuplicates() { consolidateSecrets(allResults); }
+function consolidateEndpoints(files, threshold) {
+    // Same endpoint (normalized URL, method-agnostic) found in 2+ files ->
+    // keep once with also_found_in + merged methods list. Query strings keep
+    // rows distinct; fragments dropped except graphql#Op. Mutates in place.
+    const th = threshold || 2;
+    const groups = new Map();
+    files.forEach(f => {
+        (f.endpoints || []).forEach(e => {
+            const k = canonicalEndpointKey(e);
+            if (!k) return;
+            if (!groups.has(k)) groups.set(k, []);
+            groups.get(k).push({ arr: f.endpoints, e, url: f.url, line: e.line || 0,
+                                 method: e.method || '', rank: (f.file_id || 0) * 1e6 + (e.line || 0),
+                                 main: true, sub: false });
+        });
+        (f.sub_files || []).forEach(sf => {
+            (sf.endpoints || []).forEach(e => {
+                const k = canonicalEndpointKey(e);
+                if (!k) return;
+                if (!groups.has(k)) groups.set(k, []);
+                groups.get(k).push({ arr: sf.endpoints, e, url: sf.url || f.url, line: e.line || 0,
+                                     method: e.method || '', rank: (f.file_id || 0) * 1e6 + 5e5 + (e.line || 0),
+                                     main: false, sub: true });
+            });
+        });
+    });
+    groups.forEach(g => {
+        const urls = [...new Set(g.map(x => x.url).filter(Boolean))];
+        if (urls.length < th) {
+            if (g.length > 1) g.forEach(x => { delete x.e.also_found_in; delete x.e.also_found_details; delete x.e.methods; });
+            return;
+        }
+        g.sort((a, b) => (a.main === b.main ? a.rank - b.rank : (a.main ? -1 : 1)));
+        const survivor = g[0].e;
+        const methods = [];
+        g.forEach(x => { const m = (x.method || '').trim(); if (m && !methods.includes(m)) methods.push(m); });
+        if (methods.length > 1) survivor.methods = methods; else delete survivor.methods;
+        survivor.also_found_in = urls.filter(u => u !== g[0].url);
+        const seen = new Set();
+        const details = [];
+        g.slice(1).forEach(x => {
+            const dk = x.url + '||' + x.line + '||' + x.method + '||' + (x.sub ? '1' : '0');
+            if (!seen.has(dk)) { seen.add(dk); details.push({ url: x.url, line: x.line, method: x.method, sub_file: x.sub }); }
+        });
+        survivor.also_found_details = details;
+        for (let i = 1; i < g.length; i++) {
+            const ix = g[i].arr.indexOf(g[i].e);
+            if (ix >= 0) g[i].arr.splice(ix, 1);
+        }
+    });
+    return files;
+}
+
+function consolidateDuplicates() { consolidateSecrets(allResults); consolidateEndpoints(allResults, 2); }
 
 document.querySelectorAll('.tab').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -266,11 +393,13 @@ function collectAllSecrets() {
     const out = [];
     getVisibleFiles().forEach(f => {
         (f.secrets || []).forEach(s => {
-            out.push({ type: s.type, match: s.match, file: f.url, line: s.line });
+            out.push({ type: s.type, match: s.match, file: f.url, line: s.line,
+                       also_found_in: s.also_found_in || [] });
         });
         (f.sub_files || []).forEach(sf => {
             (sf.secrets || []).forEach(s => {
-                out.push({ type: s.type, match: s.match, file: sf.url, line: s.line });
+                out.push({ type: s.type, match: s.match, file: sf.url, line: s.line,
+                           also_found_in: s.also_found_in || [] });
             });
         });
     });
@@ -574,7 +703,14 @@ function renderGlobalPanel(type) {
                             <button class="mini-copy mini-copy-inline" data-copy="${escAttr(s.match || '')}" title="Copy secret value">
                                 <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2 2v1"/></svg>
                             </button>
-                            ${dupN >= 3 ? `<span class="sec-files-note">also in ${(s.also_found_in || []).map(u => `<a href="${escAttr(u)}" target="_blank" rel="noopener">${esc(shortFileName(u))}</a>`).join(', ')}</span>` : ''}
+                            ${dupN >= 3 ? `<span class="dup-wrap dup-wrap-row">
+                                <button class="dup-toggle" data-dup-toggle aria-expanded="false"
+                                        title="Show every file containing this secret">
+                                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+                                    <span>also in ${dupN} files</span>
+                                </button>
+                                <span class="dup-files">${(s.also_found_in || []).map(u => `<a href="${escAttr(u)}" target="_blank" rel="noopener" title="${escAttr(u)}">${esc(shortFileName(u))}</a>`).join('')}</span>
+                            </span>` : ''}
                         </td>
                         <td><span class="severity severity-${s.severity}">${esc(s.severity)}</span></td>
                         <td class="sec-file"><a href="${escAttr(s._url)}" target="_blank" rel="noopener">${esc(s._file)}</a></td>
@@ -665,13 +801,28 @@ function endpointRow(ep, live) {
         else statusCls += ' status-unknown';
     }
     const methodCls = 'method-' + (ep.method || 'get').toLowerCase().replace(/[^a-z]/g, '');
+    const dupN = Array.isArray(ep.also_found_in) ? ep.also_found_in.length + 1 : 0;
+    const methods = Array.isArray(ep.methods) && ep.methods.length > 1
+        ? `<span class="ep-title" title="Seen as: ${escAttr(ep.methods.join(', '))}">${esc(ep.methods.join(' · '))}</span>` : '';
+    const dupNote = dupN >= 2
+        ? `<span class="dup-wrap dup-wrap-row">
+            <button class="dup-toggle" data-dup-toggle aria-expanded="false"
+                    title="Show every file containing this endpoint">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+                <span>also in ${dupN} files</span>
+            </button>
+            <span class="dup-files">${(ep.also_found_in || []).map(u => `<a href="${escAttr(u)}" target="_blank" rel="noopener" title="${escAttr(u)}">${esc(shortFileName(u))}</a>`).join('')}</span>
+        </span>` : '';
     return `<div class="endpoint-item">
         <span class="method-tag ${methodCls}">${esc(ep.method || 'GET')}</span>
         <a class="endpoint-url" href="${escAttr(url)}" target="_blank" rel="noopener">${esc(url)}</a>
+        ${dupN >= 2 ? `<span class="dup-badge" title="Same endpoint found in ${dupN} files">×${dupN}</span>` : ''}
         ${status ? `<span class="${statusCls}">${status}</span>` : ''}
         ${title ? `<span class="ep-title" title="${escAttr(title)}">${esc(title)}</span>` : ''}
+        ${methods}
         ${wc ? `<span class="ep-wc">${Number(wc).toLocaleString()}w</span>` : ''}
         <span class="endpoint-line">L${ep.line}</span>
+        ${dupNote}
     </div>`;
 }
 
@@ -718,6 +869,7 @@ function renderFileRows(files) {
                 </div>
             </div>
             <div class="file-row-body ${isExpanded ? 'expanded' : ''}" data-fid="${f.file_id}">
+              <div class="file-row-inner">
                 <div class="dropdown-tabs">
                     <button class="dropdown-tab ${activeTab === 'secrets' ? 'active' : ''}" data-fid="${f.file_id}" data-tab="secrets">Secrets (${secCount})</button>
                     <button class="dropdown-tab ${activeTab === 'endpoints' ? 'active' : ''}" data-fid="${f.file_id}" data-tab="endpoints">Endpoints (${epCount})</button>
@@ -732,6 +884,7 @@ function renderFileRows(files) {
                 ${hasSubs ? `<div class="dropdown-panel ${activeTab === 'subfiles' ? 'active' : ''}" data-fid="${f.file_id}" data-panel="subfiles">
                     ${renderSubFiles(f.sub_files)}
                 </div>` : ''}
+              </div>
             </div>
         `;
 
@@ -799,13 +952,28 @@ function shortFileName(url) {
     } catch { return url; }
 }
 
+function toggleDup(btn) {
+    // Open/close an Also-found-in file list. Pure DOM toggle so it stays
+    // working after every re-render; returns the new open state.
+    const wrap = btn.closest('.dup-wrap');
+    const open = wrap ? wrap.classList.toggle('open') : false;
+    if (btn.setAttribute) btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    return open;
+}
 function renderAlsoFound(s) {
     const extra = Array.isArray(s.also_found_in) ? s.also_found_in : [];
     if (!extra.length) return '';
     return `
-        <div class="sec-block-label">Also found in <span class="sec-lines">${extra.length + 1} files</span></div>
-        <div class="dup-files">${extra.map(u => `
-            <a href="${escAttr(u)}" target="_blank" rel="noopener" title="${escAttr(u)}">${esc(shortFileName(u))}</a>`).join('')}
+        <div class="sec-block-label">Duplicate secret</div>
+        <div class="dup-wrap">
+            <button class="dup-toggle" data-dup-toggle aria-expanded="false"
+                    title="Show every file containing this secret">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+                <span>Also found in ${extra.length + 1} files</span>
+            </button>
+            <div class="dup-files">${extra.map(u => `
+                <a href="${escAttr(u)}" target="_blank" rel="noopener" title="${escAttr(u)}">${esc(shortFileName(u))}</a>`).join('')}
+            </div>
         </div>`;
 }
 
@@ -934,6 +1102,12 @@ document.addEventListener('click', e => {
         validateFile(parseInt(valBtn.dataset.validateFile), valBtn);
         return;
     }
+    const dupBtn = e.target.closest('[data-dup-toggle]');
+    if (dupBtn) {
+        e.stopPropagation();
+        toggleDup(dupBtn);
+        return;
+    }
     const secHead = e.target.closest('[data-sec-toggle]');
     if (secHead) {
         const item = secHead.closest('.sec-item');
@@ -1003,13 +1177,17 @@ function buildExportData() {
                 excerpt: s.excerpt || null,
                 excerpt_pretty: s.excerpt_pretty || null,
                 also_found_in: s.also_found_in || null,
+                also_found_details: s.also_found_details || null,
                 validation: s.validation || null,
             })),
             endpoints: (f.endpoints || []).map(ep => {
                 return {
-                    method: ep.method, path: ep.path, absolute_url: ep.absolute_url,
+                    method: ep.method, methods: ep.methods || null,
+                    path: ep.path, absolute_url: ep.absolute_url,
                     line: ep.line, line_content: ep.line_content, full_match: ep.full_match,
                     probe: ep.probe || null,
+                    also_found_in: ep.also_found_in || null,
+                    also_found_details: ep.also_found_details || null,
                 };
             }),
             internal_refs: f.internal_refs || [],

@@ -45,9 +45,14 @@ except ImportError:
 
 try:
     from sourcemap import parse_sourcemap, iter_original_sources, source_paths
+    try:
+        from sourcemap import MAX_SOURCES as _SM_MAX_SOURCES
+    except ImportError:
+        _SM_MAX_SOURCES = 25
     HAS_SOURCEMAP = True
 except ImportError:
     HAS_SOURCEMAP = False
+    _SM_MAX_SOURCES = 25
 
 try:
     from validators import get_validation, render_curl, extract_value
@@ -1016,7 +1021,7 @@ class JavaScriptAnalyzer:
             }
         }
 
-    def analyze(self, url: str, max_depth: int = 1) -> AnalysisResult:
+    def analyze(self, url: str, max_depth: int = 1, probe: bool = True) -> AnalysisResult:
         errors: List[str] = []
         try:
             original_url = url
@@ -1105,7 +1110,8 @@ class JavaScriptAnalyzer:
                 'line_content': match.group(0)[:300],
             })
 
-        self.probe_endpoints(endpoints)
+        if probe:
+            self.probe_endpoints(endpoints)
 
         sub_files = []
         analyzed_urls = set()
@@ -1134,11 +1140,25 @@ class JavaScriptAnalyzer:
             paths = source_paths(map_text) if HAS_SOURCEMAP else []
             sm['embedded_sources'] = len(embedded)
             sm['source_paths'] = len(paths)
+            try:
+                total_sources = len(parsed.get('sources', [])) if parsed else len(paths)
+            except Exception:
+                total_sources = len(paths)
+            sm['sources_total'] = total_sources
+            truncated = total_sources > _SM_MAX_SOURCES
+            sm['truncated_sources'] = truncated
             if paths:
                 sample = '; '.join(paths[:3])[:240]
+                match = f'{len(paths)} original source paths'
+                if truncated:
+                    # Surface the sampling cap honestly: only the first
+                    # _SM_MAX_SOURCES originals were scanned for secrets.
+                    match += (f' ({len(embedded)} of {total_sources} '
+                              f'sources scanned — increase sourcemap.MAX_SOURCES '
+                              f'for full coverage)')
                 internal_refs.append({
                     'type': 'Exposed Source Paths', 'severity': 'info',
-                    'match': f'{len(paths)} original source paths',
+                    'match': match,
                     'line': sm['line'], 'line_content': sample,
                 })
         for ep in endpoints:
@@ -1241,6 +1261,271 @@ class JavaScriptAnalyzer:
                     break
         return [s for i, s in enumerate(secrets) if i not in drop]
 
+    @staticmethod
+    def canonical_secret_key(secret_type: str, match_text: str) -> str:
+        """Cross-file identity for a secret: type + normalized credential value.
+
+        Uses extract_value() so `apiKey = "ghp_X"` and bare `ghp_X` in
+        another file merge. Type stays case-sensitive (labels are exact) so
+        colliding shapes (Stripe vs Clerk-style keys) never merge across
+        providers. Truncated for map safety.
+        """
+        try:
+            value = extract_value(match_text or '')
+        except Exception:
+            value = match_text or ''
+        return (secret_type or '').strip() + '||' + (value or '').strip()[:300]
+
+    @staticmethod
+    def normalize_endpoint_url(url: str) -> str:
+        """Canonical form for endpoint dedup (grouping only, never for fetch).
+
+        - GraphQL `.../graphql#Operation` kept verbatim (op name is identity,
+          case-sensitive).
+        - Absolute URLs: lowercase scheme+host, drop default ports, strip
+          trailing `/` (except root), drop fragment, KEEP query (different
+          params = different surface), preserve path case.
+        - Relative paths: strip trailing `/`, preserve case, keep query.
+        Anything unparseable returns the stripped input (fail-open: stays
+        distinct rather than merging wrongly).
+        """
+        if not url:
+            return ''
+        u = (url or '').strip()
+        if not u:
+            return ''
+        # GraphQL operation URLs carry the op name after # — identity.
+        if '/graphql#' in u:
+            return u
+        try:
+            parsed = urlparse(u)
+            if not parsed.scheme and not parsed.netloc:
+                # Relative path like /api/v1/users/?a=1
+                path = parsed.path or u.split('?', 1)[0].split('#', 1)[0]
+                q = ''
+                if '?' in u:
+                    q = u.split('?', 1)[1].split('#', 1)[0]
+                    q = '?' + q if q else ''
+                if len(path) > 1 and path.endswith('/'):
+                    path = path.rstrip('/')
+                return (path or '/') + q
+            scheme = (parsed.scheme or '').lower()
+            host = (parsed.hostname or '').lower()
+            if not host:
+                return u
+            port = parsed.port
+            if port and not ((scheme == 'https' and port == 443) or
+                             (scheme == 'http' and port == 80)):
+                host = f"{host}:{port}"
+            path = parsed.path or '/'
+            if len(path) > 1 and path.endswith('/'):
+                path = path.rstrip('/')
+            out = f"{scheme}://{host}{path}"
+            if parsed.query:
+                out += '?' + parsed.query
+            return out
+        except Exception:
+            return u
+
+    @classmethod
+    def canonical_endpoint_key(cls, ep: Dict[str, Any]) -> str:
+        """Cross-file identity for an endpoint (method-agnostic by design).
+
+        `GET /api/x` + `POST /api/x` merge into one row with a merged
+        `methods` list on the survivor, so verb-specific surface is preserved
+        in display rather than dropped. Query strings keep rows distinct.
+        """
+        raw = ep.get('absolute_url') or ep.get('path') or ''
+        return cls.normalize_endpoint_url(raw)
+
+    def consolidate_secrets_cross_file(
+            self, file_dicts: List[Dict[str, Any]], threshold: int = 3
+    ) -> List[Dict[str, Any]]:
+        """Collapse identical secrets seen across >=threshold files.
+
+        Mutates dicts in place (same contract as frontend consolidateSecrets)
+        and returns them. Grouping key is canonical (type + extracted value).
+        Survivor prefers a main-file entry with the lowest (file_id, line);
+        it gets `also_found_in: [urls]` + additive `also_found_details:
+        [{url, line, sub_file}]`. Groups below threshold have stale markers
+        cleared so re-runs are idempotent. Single-file input is a no-op.
+        """
+        if not file_dicts or len(file_dicts) < 2:
+            return file_dicts
+        groups: Dict[str, list] = {}
+        for f in file_dicts:
+            fid = f.get('file_id', 0) or 0
+            for s in (f.get('secrets') or []):
+                k = self.canonical_secret_key(s.get('type', ''), s.get('match', ''))
+                groups.setdefault(k, []).append(
+                    {'arr': f.setdefault('secrets', []), 's': s,
+                     'url': f.get('url', ''), 'line': s.get('line', 0) or 0,
+                     'rank': fid * 1000000 + (s.get('line', 0) or 0),
+                     'main': True, 'sub': False})
+            for sf in (f.get('sub_files') or []):
+                for s in (sf.get('secrets') or []):
+                    k = self.canonical_secret_key(s.get('type', ''), s.get('match', ''))
+                    groups.setdefault(k, []).append(
+                        {'arr': sf.setdefault('secrets', []), 's': s,
+                         'url': sf.get('url') or f.get('url', ''),
+                         'line': s.get('line', 0) or 0,
+                         'rank': fid * 1000000 + 500000 + (s.get('line', 0) or 0),
+                         'main': False, 'sub': True})
+        for g in groups.values():
+            urls = list(dict.fromkeys(x['url'] for x in g if x['url']))
+            if len(urls) < threshold:
+                # Idempotent: lone survivor from a prior pass keeps its
+                # markers; only clear when genuine duplicates are present.
+                if len(g) > 1:
+                    for x in g:
+                        x['s'].pop('also_found_in', None)
+                        x['s'].pop('also_found_details', None)
+                continue
+            g.sort(key=lambda a: (0 if a['main'] else 1, a['rank']))
+            survivor = g[0]
+            others = [x for x in g[1:] if x['url'] != survivor['url']
+                      or x['line'] != survivor['line']]
+            survivor['s']['also_found_in'] = [x['url'] for x in g
+                                              if x['url'] != survivor['url']]
+            # De-dupe detail rows while preserving order.
+            seen = set()
+            details = []
+            for x in g:
+                if x is survivor:
+                    continue
+                dk = (x['url'], x['line'], x['sub'])
+                if dk in seen:
+                    continue
+                seen.add(dk)
+                details.append({'url': x['url'], 'line': x['line'],
+                                'sub_file': x['sub']})
+            survivor['s']['also_found_details'] = details
+            for x in g[1:]:
+                try:
+                    ix = x['arr'].index(x['s'])
+                except ValueError:
+                    continue
+                x['arr'].pop(ix)
+        return file_dicts
+
+    def consolidate_endpoints_cross_file(
+            self, file_dicts: List[Dict[str, Any]], threshold: int = 2
+    ) -> List[Dict[str, Any]]:
+        """Collapse identical endpoints seen across >=threshold files.
+
+        Same in-place contract as secrets. Survivor keeps its own probe/line
+        content and gains `also_found_in`, `also_found_details`, and merged
+        `methods` list so no verb information is lost.
+        """
+        if not file_dicts or len(file_dicts) < 2:
+            return file_dicts
+        groups: Dict[str, list] = {}
+        for f in file_dicts:
+            fid = f.get('file_id', 0) or 0
+            for e in (f.get('endpoints') or []):
+                k = self.canonical_endpoint_key(e)
+                if not k:
+                    continue
+                groups.setdefault(k, []).append(
+                    {'arr': f.setdefault('endpoints', []), 'e': e,
+                     'url': f.get('url', ''), 'line': e.get('line', 0) or 0,
+                     'method': e.get('method', '') or '',
+                     'rank': fid * 1000000 + (e.get('line', 0) or 0),
+                     'main': True, 'sub': False})
+            for sf in (f.get('sub_files') or []):
+                for e in (sf.get('endpoints') or []):
+                    k = self.canonical_endpoint_key(e)
+                    if not k:
+                        continue
+                    groups.setdefault(k, []).append(
+                        {'arr': sf.setdefault('endpoints', []), 'e': e,
+                         'url': sf.get('url') or f.get('url', ''),
+                         'line': e.get('line', 0) or 0,
+                         'method': e.get('method', '') or '',
+                         'rank': fid * 1000000 + 500000 + (e.get('line', 0) or 0),
+                         'main': False, 'sub': True})
+        for g in groups.values():
+            urls = list(dict.fromkeys(x['url'] for x in g if x['url']))
+            if len(urls) < threshold:
+                if len(g) > 1:
+                    for x in g:
+                        x['e'].pop('also_found_in', None)
+                        x['e'].pop('also_found_details', None)
+                        x['e'].pop('methods', None)
+                continue
+            g.sort(key=lambda a: (0 if a['main'] else 1, a['rank']))
+            survivor = g[0]['e']
+            methods = []
+            for x in g:
+                m = (x['method'] or '').strip()
+                if m and m not in methods:
+                    methods.append(m)
+            if len(methods) > 1:
+                survivor['methods'] = methods
+            else:
+                survivor.pop('methods', None)
+            survivor['also_found_in'] = [u for u in urls
+                                         if u != g[0]['url']]
+            seen = set()
+            details = []
+            for x in g:
+                if x['e'] is survivor:
+                    continue
+                dk = (x['url'], x['line'], x['method'], x['sub'])
+                if dk in seen:
+                    continue
+                seen.add(dk)
+                details.append({'url': x['url'], 'line': x['line'],
+                                'method': x['method'], 'sub_file': x['sub']})
+            survivor['also_found_details'] = details
+            for x in g[1:]:
+                try:
+                    ix = x['arr'].index(x['e'])
+                except ValueError:
+                    continue
+                x['arr'].pop(ix)
+        return file_dicts
+
+    def probe_across_files(self, file_dicts: List[Dict[str, Any]],
+                           max_workers: int = 8) -> None:
+        """Probe each distinct raw endpoint URL once, fan results out.
+
+        Grouping for display uses the normalized key, but probing uses the
+        exact raw `absolute_url` (trailing-slash/query variants can behave
+        differently, so they are probed separately — no result loss).
+        Safe to call even when endpoints already carry probes (fills gaps).
+        """
+        targets: Dict[str, list] = {}
+        for f in file_dicts:
+            for e in (f.get('endpoints') or []):
+                raw = e.get('absolute_url') or e.get('path') or ''
+                if raw and not e.get('probe'):
+                    targets.setdefault(raw, []).append(e)
+        if not targets:
+            return
+        urls = list(targets.keys())
+        probes: Dict[str, Dict[str, Any]] = {}
+        try:
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(max_workers, len(urls))) as ex:
+                future_to_url = {ex.submit(self.probe_endpoint, u): u
+                                 for u in urls}
+                for future in concurrent.futures.as_completed(
+                        future_to_url, timeout=30):
+                    u = future_to_url[future]
+                    try:
+                        probes[u] = future.result()
+                    except Exception:
+                        probes[u] = {'status': None, 'title': '',
+                                     'word_count': 0, 'content_length': 0,
+                                     'final_url': u, 'content_type': ''}
+        except Exception:
+            return
+        for raw, eps in targets.items():
+            if raw in probes:
+                for e in eps:
+                    e['probe'] = probes[raw]
+
     def _empty_result(self, url: str, errors: List[str]) -> AnalysisResult:
         return AnalysisResult(
             url=url, secrets=[], endpoints=[], internal_refs=[], comments=[], emails=[],
@@ -1310,7 +1595,8 @@ def main() -> None:
         for s in result.secrets:
             item = {k: s.get(k) for k in (
                 'type', 'severity', 'match', 'line', 'line_content',
-                'excerpt', 'validation')}
+                'excerpt', 'validation', 'also_found_in',
+                'also_found_details')}
             if args.validate and _live is not None:
                 v = item.get('validation') or {}
                 if v.get('requires_pairing'):
@@ -1331,9 +1617,12 @@ def main() -> None:
             'errors': result.errors,
             'secrets': secrets,
             'endpoints': [
-                {'method': e.get('method'), 'path': e.get('path'),
+                {'method': e.get('method'), 'methods': e.get('methods'),
+                 'path': e.get('path'),
                  'absolute_url': e.get('absolute_url'), 'line': e.get('line'),
-                 'probe': e.get('probe')}
+                 'probe': e.get('probe'),
+                 'also_found_in': e.get('also_found_in'),
+                 'also_found_details': e.get('also_found_details')}
                 for e in result.endpoints
             ],
             'internal_refs': result.internal_refs,
@@ -1342,11 +1631,25 @@ def main() -> None:
             'wordlist': report_wl if args.wordlist_out else [],
         }
         all_reports.append(report)
-        if not args.out_file:
-            print(f"\n=== {result.url} ===")
-            print(f"secrets={len(secrets)} endpoints={len(result.endpoints)} "
-                  f"internal={len(result.internal_refs)} errors={result.errors}")
-            for s in secrets:
+
+    if len(all_reports) > 1:
+        # Cross-file consolidation for batch runs (additive fields only;
+        # single-file output unchanged). Runs before stdout + JSON output
+        # so both stay consistent with the API/UI.
+        for i, r in enumerate(all_reports):
+            r.setdefault('file_id', i + 1)
+        try:
+            analyzer.consolidate_secrets_cross_file(all_reports, threshold=3)
+            analyzer.consolidate_endpoints_cross_file(all_reports, threshold=2)
+        except Exception:
+            pass
+
+    if not args.out_file:
+        for r in all_reports:
+            print(f"\n=== {r['url']} ===")
+            print(f"secrets={len(r['secrets'])} endpoints={len(r['endpoints'])} "
+                  f"internal={len(r['internal_refs'])} errors={r['errors']}")
+            for s in r['secrets']:
                 live = s.get('live')
                 tag = ''
                 if isinstance(live, dict):
@@ -1356,7 +1659,15 @@ def main() -> None:
                         tag = ' [dead]'
                     elif not live.get('checked'):
                         tag = ' [manual]'
+                dup = s.get('also_found_in') or []
+                if dup:
+                    tag += f" [+{len(dup)} file(s): " + ", ".join(dup) + "]"
                 print(f"  [{s['severity']}] {s['type']} L{s['line']}{tag}")
+            for e in r['endpoints']:
+                dup = e.get('also_found_in') or []
+                if dup:
+                    print(f"  [endpoint] {e.get('absolute_url')}"
+                          f" (also in {len(dup) + 1} files)")
 
     if args.out_file:
         with open(args.out_file, 'w') as f:

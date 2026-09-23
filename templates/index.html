@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Specter — JS Security Recon</title>
-    <link rel="icon" type="image/png" href="https://avatars.githubusercontent.com/u/212823433?s=400&u=cf6999ae50fc524333b6a06c13c15809017e1281&v=4">
+    <link rel="icon" type="image/png" href="{{ url_for('static', filename='img/logo.png') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 </head>
 <body>
@@ -13,7 +13,7 @@
             <div class="brand">
                 <div class="logo-ring">
                     <a href="https://sayed.is-a.dev" target="_blank" rel="noopener" title="sayed.is-a.dev" style="display:block;line-height:0">
-                        <img src="https://avatars.githubusercontent.com/u/212823433?s=400&u=cf6999ae50fc524333b6a06c13c15809017e1281&v=4" alt="Specter logo" class="logo">
+                        <img src="{{ url_for('static', filename='img/logo.png') }}" alt="Specter logo" class="logo">
                     </a>
                     <span class="logo-pulse" aria-hidden="true"></span>
                 </div>
@@ -23,7 +23,7 @@
                 </div>
             </div>
             <div class="hero-badges">
-                <span class="pill"><span class="dot dot-live"></span>90+ secret detectors</span>
+                <span class="pill"><span class="dot dot-live"></span>146 secret detectors</span>
                 <span class="pill"><span class="dot dot-accent"></span>Zero-FP engine</span>
                 <span class="pill"><span class="dot dot-ok"></span>Read-only validation</span>
             </div>
@@ -118,6 +118,7 @@
                         <option value="high">High</option>
                         <option value="medium">Medium</option>
                         <option value="low">Low</option>
+                        <option value="info">Info</option>
                     </select>
                 </div>
                 <div class="toolbar-group">

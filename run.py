@@ -212,18 +212,30 @@ def analyze():
             if not url:
                 continue
             try:
-                result = analyzer.analyze(url)
+                # Defer probing in batch mode so each distinct URL is
+                # probed once across all files (see probe_across_files).
+                # Single-file scans behave exactly as before.
+                result = analyzer.analyze(url, probe=(len(urls) == 1))
                 rd = result_to_dict(result, idx)
                 results.append(rd)
-                with sessions_lock:
-                    sessions[session_id]['files'].append(rd)
-                    sessions[session_id]['completed'] += 1
             except Exception as e:
                 er = error_result(url, idx, f'Analysis failed: {str(e)}')
                 results.append(er)
-                with sessions_lock:
-                    sessions[session_id]['files'].append(er)
-                    sessions[session_id]['completed'] += 1
+
+        try:
+            # Fill probes once across the batch (no-op when already probed).
+            analyzer.probe_across_files(results)
+        except Exception:
+            pass
+        if len(results) > 1:
+            try:
+                analyzer.consolidate_secrets_cross_file(results, threshold=3)
+                analyzer.consolidate_endpoints_cross_file(results, threshold=2)
+            except Exception:
+                pass
+        with sessions_lock:
+            sessions[session_id]['files'] = results
+            sessions[session_id]['completed'] = len(results)
 
         return jsonify({
             'session_id': session_id,
@@ -265,12 +277,20 @@ def analyze_stream():
                 progress = int((idx / total) * 100)
                 yield f"data: {json.dumps({'type': 'progress', 'current': idx, 'total': total, 'percent': progress, 'url': url})}\n\n"
                 try:
+                    # Keep per-file probing here so live rows show status
+                    # during streaming (no behavior change vs before).
                     result = analyzer.analyze(url)
                     rd = result_to_dict(result, idx)
                 except Exception as e:
                     rd = error_result(url, idx, str(e))
                 results.append(rd)
                 yield f"data: {json.dumps({'type': 'file_result', 'result': rd})}\n\n"
+            if len(results) > 1:
+                try:
+                    analyzer.consolidate_secrets_cross_file(results, threshold=3)
+                    analyzer.consolidate_endpoints_cross_file(results, threshold=2)
+                except Exception:
+                    pass
             yield f"data: {json.dumps({'type': 'complete', 'total': total, 'results': results})}\n\n"
 
         return Response(
@@ -310,7 +330,9 @@ def validate_all():
     if len(secrets) > 300:
         return jsonify({'error': 'Too many secrets in one batch (max 300).'}), 400
 
-    # De-duplicate by (type, match).
+    # De-duplicate by canonical (type + extracted value) so the same
+    # secret in different assignment styles validates once. Origin files
+    # are preserved for attribution.
     seen = set()
     queue = []
     for s in secrets:
@@ -320,12 +342,16 @@ def validate_all():
         match = (s.get('match') or '').strip()
         if not label or not match:
             continue
-        key = (label, match[:200])
+        try:
+            key = analyzer.canonical_secret_key(label, match)
+        except Exception:
+            key = (label, match[:200])
         if key in seen:
             continue
         seen.add(key)
         queue.append({'type': label, 'match': match[:300],
-                      'file': s.get('file', ''), 'line': s.get('line', '')})
+                      'file': s.get('file', ''), 'line': s.get('line', ''),
+                      'also_found_in': s.get('also_found_in') or []})
 
     def _check(item):
         label, match = item['type'], item['match']
@@ -340,6 +366,7 @@ def validate_all():
         if manual:
             return {
                 'type': label, 'file': item['file'], 'line': item['line'],
+                'also_found_in': item.get('also_found_in') or [],
                 'masked': _mask(value), 'status': 'manual',
                 'detail': 'Needs a paired value / manual step - see curl command.',
                 'command': command, 'indicator': indicator,
@@ -348,6 +375,7 @@ def validate_all():
         if not live.get('checked'):
             return {
                 'type': label, 'file': item['file'], 'line': item['line'],
+                'also_found_in': item.get('also_found_in') or [],
                 'masked': _mask(value), 'status': 'manual',
                 'detail': live.get('reason', 'Manual validation required.'),
                 'command': command, 'indicator': indicator,
@@ -363,6 +391,7 @@ def validate_all():
             detail = live.get('error') or f'Inconclusive (HTTP {code}). Retry or validate manually.'
         return {
             'type': label, 'file': item['file'], 'line': item['line'],
+            'also_found_in': item.get('also_found_in') or [],
             'masked': _mask(value), 'status': status, 'status_code': code,
             'detail': detail, 'command': command, 'indicator': indicator,
         }
